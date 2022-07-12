@@ -1,0 +1,177 @@
+---
+title: Survival via (Semi) Paramteric modeling
+output: 
+  html_document:
+    toc: false
+    toc_depth: 3
+    toc_float: true
+    code_folding: hide
+
+date: "`r format(Sys.time(), '%d %B %Y')`"
+params:
+  sub_grp_anlsys: full
+  psm: 0
+ 
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(comment='',
+ root.dir = "/regeneron_effectiveness/code/R/",
+  output_dir = "./Results",
+  output_file = "Results/full_analysis.html",
+	echo = FALSE,
+	message = FALSE,
+	warning = FALSE
+)
+```
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+library(ggplot2)
+library(glue)
+library(dplyr)
+library(feather)
+library(cobalt)
+library(knitr)
+library(lubridate)
+library(jtools)
+library(flextable)
+library(collections)
+library(survminer)
+library(car)
+library(VIM) # for missing data
+library(tidyverse)
+```
+
+```{r echo=FALSE}
+source("./survival.R")
+options(scipen = 999)
+
+inner_params = dict(list(RD_factor = 1000.0,
+                         perc = 2,
+                         store_results=T,
+                         fwp_days=30,
+                         n_cores = 15,
+                         type='prod',
+                         fwp_days = 28,
+                         n_iterations = 1000))
+
+
+```
+
+```{r}
+input_table = "feathers/matched/regeneron_effectivness_matched.feather"
+```
+
+```{r}
+df_raw = read_feather (input_table) 
+```
+
+
+## Analysis type: `r params$sub_grp_anlsys` \
+### data file : `r input_table`\
+### maximal followp days :  `r inner_params$get("fwp_days")`\
+### administrative end of followup :  `r max(as.Date((df_raw$retrieval_date)))`\
+### distance method for matching  (0 = mahalanobis, 1 = PS) =  `r params$psm` \
+
+
+```{r echo=FALSE}
+
+
+```{r}
+df_severe = calc_survival_variables(df_raw, "first_time_severe_clean", params$sub_grp_anlsys,inner_params)
+df_hosp   = calc_survival_variables(df_raw, "first_time_hosp", params$sub_grp_anlsys, inner_params)
+df_death  = calc_survival_variables(df_raw, "date_ptira_corona", params$sub_grp_anlsys, inner_params)
+```
+
+```{r}
+stratified_count = function(df) {
+df %>% 
+  group_by(exposure_cat, is_event) %>% 
+  count() %>% 
+    kable()
+}
+
+```
+### hospitalization events count
+```{r}
+stratified_count(df_hosp)
+```
+
+
+### severe events count
+```{r}
+stratified_count(df_severe)
+```
+
+### death events count
+```{r}
+stratified_count(df_death)
+```
+
+
+### gender counts in current analysis : 
+```{r}
+df_hosp %>%  select(sex, exposure_cat) %>% group_by(sex) %>%  count() %>% kable()
+```
+
+```{r eval=FALSE, include=FALSE}
+
+df_hosp %>% 
+  group_by(psw_preg , simplified_vacc1_ww , sw_waned_immunity) %>% 
+  count()
+```
+## verify No missing values
+```{r echo=FALSE}
+# Missing data plot
+aggr(df_hosp, col=c('navyblue','red'), numbers=T, sortVars=TRUE, plot = F, labels=names(data), cex.axis=.7, gap=3, ylab=c("Histogram of missing data","Pattern"))
+
+```
+
+```{r}
+formula_str = 'Surv(days_of_fwp, is_event) ~ exposure_cat +  age  + as.factor(pn_flu_vacc_5yr) + bmi_cat + pc_smoke_desc   +   sex + as.factor(SES) + sector_cat + sw_imunosuppressed +   sw_waned_immunity + sw_heart + sw_diabetes+ sw_respiratory + psw_cdc_possible_htn + as.factor(simplified_vacc1_ww)+   psw_cdc_certain_ckd+ psw_cdc_certain_cancer+ psw_cdc_possible_neuro+ psw_hepatic'
+```
+
+## A glimpse on multi collinearity with num_vacc_doses
+```{r}
+car::vif(glm(is_event ~ exposure_cat +  age  + as.factor(pn_flu_vacc_5yr) + bmi_cat + pc_smoke_desc +  num_vacc_doses+  as.factor(SES) + sector_cat + sw_imunosuppressed +   sw_waned_immunity + sw_heart + sw_diabetes+ sw_respiratory + psw_cdc_possible_htn + as.factor(simplified_vacc1_ww)+   psw_cdc_certain_ckd+ psw_cdc_certain_cancer+ psw_cdc_possible_neuro+ psw_hepatic ,data = df_hosp, singular.ok = TRUE))
+```
+
+```{r}
+car::vif(glm(is_event ~ exposure_cat +  age  + as.factor(pn_flu_vacc_5yr) + bmi_cat + pc_smoke_desc +  as.factor(SES) + sector_cat + sw_imunosuppressed +   sw_waned_immunity + sw_heart + sw_diabetes+ sw_respiratory + psw_cdc_possible_htn + as.factor(simplified_vacc1_ww)+   psw_cdc_certain_ckd+ psw_cdc_certain_cancer+ psw_cdc_possible_neuro+ psw_hepatic ,data = df_hosp, singular.ok = TRUE))
+```
+
+# Unadjusted Cox Model: hospitalizations
+```{r}
+get_cox_output(df_hosp,'Surv(days_of_fwp, is_event) ~ exposure_cat') 
+```
+
+
+# Adjusted Cox Model: hospitalizations
+```{r}
+get_cox_output(df_hosp,formula_str, filename= glue("cox_hospitalizations_{params$sub_grp_anlsys}.docx")) 
+```
+
+# Unadjusted Cox Model: Severe Covid-19
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+get_cox_output(df_severe,'Surv(days_of_fwp, is_event) ~ exposure_cat') 
+```
+
+# Cox Model:Severe Covid-19
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+get_cox_output(df_severe, formula_str, filename = glue("cox_severe_{params$sub_grp_anlsys}.docx")) 
+```
+
+# Unadjusted Cox Model: Death
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+get_cox_output(df_death,'Surv(days_of_fwp, is_event) ~ exposure_cat') 
+```
+
+# Cox Model: Death 
+```{r echo=FALSE}
+ if (params$sub_grp_anlsys != 'below_60') {
+  get_cox_output(df_death, formula_str, ph_test = F , filename = glue("cox_death_{params$sub_grp_anlsys}.docx"))  
+ }
+```
+
+

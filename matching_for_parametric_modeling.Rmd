@@ -1,0 +1,517 @@
+---
+title: Regeneron effectivness  matching
+output: 
+  html_document:
+    toc: false
+    toc_depth: 3
+    toc_float: true
+    code_folding: hide
+date: "`r format(Sys.time(), '%d %B %Y')`"
+params:
+  min_age: 12
+  input_table: regeneron_effectivness
+  omicron_table: covid_sequencing
+  create_tables: 1
+  create_table1: 1
+  create_table3: 1
+  num_controls: 5
+  filter_missing_covariates: 1
+  psm: 0
+
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(root.dir = "/regeneron_effectiveness/code/R/Results/")
+```
+
+## parameters:
+  * input_table =  `r params$input_table`\
+  * ages =`r params$min_age` - and above\
+  * create_tables = `r params$create_tables`\
+  * filter_missing_covariates = `r params$filter_missing_covariates`\
+  * distance method for matching  (0 = mahalanobis, 1 = PS) =  `r params$psm` \
+Note: scroll down to define matching formulas
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(plyr)
+library(tidyverse)
+library(RODBC)
+library(dbplyr)
+library(gtsummary)
+library(ggplot2)
+library(MatchIt)
+library(glue)
+library(feather)
+library(cobalt)
+library(knitr)
+library(cri.utils)
+library(lubridate)
+library(flextable)
+library(formula.tools)
+library(dplyr)
+```
+
+
+```{r include=FALSE}
+source("./utils.R")
+```
+
+
+```{r include=FALSE}
+options(scipen = 999)
+
+set.seed(2023)
+# Note: for optimal matching is better to leave numerical varaible uncategorized
+# and just recode missing value as an extreemly low number like -999
+# so a non missing value will not be matched to a missing value 
+NUMERIC_NA = as.numeric(-999)
+
+```
+
+```{r include=FALSE}
+con <- cri_connection()
+```
+
+
+```{r read sql,  include=FALSE}
+filename = glue("feathers/{params$input_table}.feather")
+if (file.exists(filename)) {
+  df_raw = read_feather (filename)
+} else {
+df_raw = connect_table(con, params$input_table) %>%
+  distinct() %>%
+  collect()
+write_feather(df_raw, filename)
+}
+```
+
+```{r}
+df_omc = connect_table(con, params$omicron_table) %>%
+  select(-teudat_zehut, -shem_prati, -shem_mishpacha)  %>%
+  filter(status %in% c('omicron_high_prob', 'omicron_sequenced')) %>% 
+  distinct() %>%
+  collect()
+```
+
+## num initial regeneron recipients
+```{r initial stats, eval=FALSE, include=FALSE}
+reg_df %>%
+  rename_with ( simplify) %>%
+  filter(!is.na(regeneron_date)) %>% 
+  select(teudat_zehut_with_bikoret) %>% 
+  dplyr::summarise(n=n()) %>% 
+  pull(n)
+```
+```{r echo=FALSE}
+df_raw = df_raw %>%
+  print_total( "initial entries") %>% 
+  filter(invalid_tz == 0) %>% 
+  print_total( "after filtering invalid TZ entries") %>% 
+  left_join(df_omc, by=c('guid_tz' =  'Guid_tz')) %>% 
+  filter(is.na(status) | ( status != 'omicron_sequenced' & status != 'omicron_high_prob')) %>% 
+  print_total( "after filtering omicron")
+```
+
+
+```{r initial cleaning, echo=FALSE}
+df_raw = df_raw %>%
+  filter(sw_continuous_membership == 1) %>%
+  print_total("after filtering non continuous members") %>% 
+  mutate(psw_nursing_home = replace_na(psw_nursing_home, 0)) %>%
+  mutate(age = pn_age) %>%
+  mutate(SES = case_when(is.na(SES) ~  as.character('unknwon'), T ~ as.character(SES))) %>%
+  mutate(SES = plyr::mapvalues(SES, from = c("1", "2", "3"), to = c('Low', 'Medium', 'High'))) %>% 
+  mutate(SES = as.factor(SES)) %>% 
+  mutate(SES = fct_relevel(SES, "Low","Medium", "High")) %>%
+  mutate(across(contains('days_from_dose'), function(x) { ifelse(x<0, as.numeric(NA_integer_),x)})) %>%
+  distinct(guid_tz, index_date, .keep_all = TRUE) %>% 
+  print_total("after distinct(guid_tz, index_date)")
+
+```
+
+```{r}
+# negative days_from_dose_1 means vaccination after the positive PCR - this is irrlevant for our study
+df_raw = df_raw %>%
+  mutate(days_from_dose_1 = case_when(days_from_dose_1 <=0 ~ NA_real_, T ~ days_from_dose_1))
+```
+
+```{r age filtering, echo=FALSE}
+  df = df_raw %>%
+    filter(between(age, params$min_age, 120)) %>% 
+  print_total("after age filtering")
+```
+
+
+```{r time to outcome calc, echo=FALSE}
+  fwp_end_date =  max(as.Date((df_raw$retrieval_date)))
+df = df %>%
+ mutate (days_to_hosp    = as.numeric(difftime(first_time_hosp, index_date,       units = "days"))) %>%
+ mutate (days_to_severe  = as.numeric(difftime(first_time_severe_clean, index_date,units = "days"))) %>%
+ mutate (days_to_death   = as.numeric(difftime(date_ptira_corona, index_date,     units = "days"))) %>%
+ mutate (days_to_end_fwp = as.numeric(difftime(fwp_end_date, index_date,     units = "days"))) %>%
+ filter (is.na(days_to_hosp) | days_to_hosp >= 0) %>%
+ print_total("after filtering hosp outcome before index_date ") %>%
+ filter (is.na(days_to_severe) | days_to_severe >= 0) %>%
+ print_total("after filtering severe outcome before index_date ") %>%
+ filter (is.na(days_to_death) | days_to_death >= 0) %>%
+ print_total("after filtering death outcome before index_date ") %>%
+ mutate (days_from_treatment_to_hosp = as.numeric(difftime(first_time_hosp, regeneron_date,  units = "days"))) %>% 
+ filter (is.na(days_from_treatment_to_hosp) | days_from_treatment_to_hosp >= 0) %>%
+ print_total("after filtering hospitalization outcome before intervention ") %>% 
+ mutate (days_from_treatment_to_severe = as.numeric(difftime(first_time_severe_clean, regeneron_date,  units = "days"))) %>% 
+ filter (is.na(days_from_treatment_to_severe) | days_from_treatment_to_severe >= 0) %>%
+ print_total("after filtering severe outcome before intervention ") 
+```
+
+```{r}
+df = df %>%
+  mutate(vacc1_ww_raw = round(as.numeric(difftime(Date_hisun_dose_1, ymd('2020-12-20'), units = "week")))) %>% 
+  filter(is.na(vacc1_ww_raw) | vacc1_ww_raw >= 0) %>% 
+  print_total(glue("after filtering invalid first vaccine dose date ")) 
+hist(df$vacc1_ww_raw, breaks =100)
+```
+
+```{r num weeks from start of campaign to 1st vaccination, include=FALSE}
+df = df %>%
+  mutate(vacc1_ww = case_when(is.na(vacc1_ww_raw)                  ~ NUMERIC_NA, 
+                                          T                        ~ vacc1_ww_raw)) %>%
+  mutate(simplified_vacc1_ww = case_when(is.na(vacc1_ww_raw)       ~ 'unvacc', 
+                                          between(vacc1_ww,0,3)    ~ '0-3',
+                                          between(vacc1_ww,4,7)    ~ '4-7',
+                                          between(vacc1_ww,8,10)   ~ '8-10',
+                                          between(vacc1_ww,11,19)  ~ '11-19',
+                                          T                        ~ '20+')) %>% 
+  mutate(simplified_vacc1_ww = fct_relevel(simplified_vacc1_ww, 'unvacc','0-3', '4-7', '8-10','11-19', '20+'))  
+```
+```{r is waning immunity, echo=FALSE}
+df = df %>% 
+  mutate(days_from_last_dose_to_infection = pmin(days_from_dose_1, days_from_dose_2, days_from_dose_3, na.rm = T)) %>% 
+  mutate(sw_waned_immunity = case_when(num_vacc_doses >=2 & days_from_last_dose_to_infection < 150    ~ 0, 
+                                                                T                                     ~ 1))
+```
+
+```{r eval=FALSE, include=FALSE}
+df %>% 
+  group_by(sw_waned_immunity) %>%
+  count()
+```
+
+
+
+```{r applying complete cases on BMI and smoking}
+if (params$filter_missing_covariates ==1) {
+df1 = df %>% 
+  filter(!is.na(bmi_cat)) %>%
+  print_total( "after removing entries with missing BMI") %>% 
+  filter(!is.na(pc_smoke_desc)) %>% 
+  print_total( "after removing entries with missing smoking status")
+} else {
+  df1 = df
+}
+```
+
+```{r params filtering, include=FALSE}
+df2 = df1 %>%
+  mutate(SES = factor(SES)) %>%
+  mutate(exposure = if_else(!is.na(regeneron_date), 1,0)) %>% 
+  mutate(exposure_cat = factor(exposure)) %>% 
+  mutate(bmi = case_when(is.na(bmi) ~ 0,  
+                                   T ~ bmi)) %>%
+  mutate(bmi_cat = case_when(is.na(bmi_cat) ~ 'unknown',
+                             T ~ bmi_cat)) %>% 
+
+  mutate(pc_smoke_desc = case_when(is.na(pc_smoke_desc) ~ 'unknown',
+                                   T ~ pc_smoke_desc)) %>% 
+ 
+  mutate(pc_ses_comb20 = case_when(is.na(pc_ses_comb20) ~ NUMERIC_NA, 
+                                  T ~ as.numeric(pc_ses_comb20))) 
+  
+```
+
+```{r include=FALSE}
+df3 = df2 %>% 
+  mutate(num_cdc_risk_factors = case_when(pn_cdc_risk_factors >= 4 ~ as.character('4+'),
+                                          T                        ~ as.character(pn_cdc_risk_factors))) %>% 
+  mutate(sector_cat = case_when(
+    sector == 'כללי' ~ 'general',
+    sector == 'מגזר החרדים' ~ 'orthodox_jew',
+    sector == 'מגזר ערבי' ~ 'arab',
+    T ~ 'unknown'
+    )) %>%
+  mutate(sector_cat = factor(sector_cat)) %>%
+  mutate (sector_cat = fct_relevel(sector_cat, "general")) %>%
+  mutate(pn_flu_vacc_5yr = if_else(pn_flu_vacc_5yr >=5, as.numeric(5), as.numeric(pn_flu_vacc_5yr))) %>%
+  mutate(pn_gp_visits_1yr = if_else(pn_gp_visits_1yr >=5, '5+', as.character(pn_gp_visits_1yr))) %>%
+  mutate(age_group = case_when(
+    between(age, 12, 18) ~ "12-18",
+    between(age, 19, 29) ~ "19-29",
+    between(age, 30, 39) ~ "30-39",
+    between(age, 40, 49) ~ "40-49",
+    between(age, 50, 59) ~ "50-59",
+    between(age, 60, 69) ~ "60-69",
+    between(age, 70, 74) ~ "70-74",
+    age >= 75 ~ "75+",
+  )) %>%
+  mutate(obesity = between(bmi, 30,40)) %>% 
+  mutate(severe_obesity = case_when(bmi >= 40 ~ 1, T ~0)) %>% 
+  mutate(overweight = between(bmi, 25,29.999)) %>% 
+  mutate(pcr_date = index_date) %>% 
+  mutate(sw_heart = pmax(psw_cdc_possible_cereb_vasc, psw_heart)) %>% 
+  mutate(sw_diabetes = pmax(psw_dm_type1, psw_dm_type2)) %>% 
+  mutate(sw_respiratory = pmax(psw_cdc_possible_asthma, psw_cdc_certain_copd, psw_cdc_possible_other_resp)) 
+
+  
+```  
+
+
+
+# Table1
+#### Initial population stratified by epxosure
+```{r table1, echo=FALSE}
+if (params$create_tables == 1 | params$create_table1 ==1) {
+  table1 = tbl_summary(
+      df3 %>% 
+select (exposure_cat , age, age_group , sector_cat , sex, SES , pn_flu_vacc_5yr, pn_pcr_tests_9m, bmi_cat,  pc_smoke_desc,  num_cdc_risk_factors, psw_active_malig, psw_cdc_certain_ckd, psw_cdc_certain_copd, psw_cdc_certain_heart,
+        severe_obesity,obesity, overweight, psw_preg, psw_cdc_certain_sickle, psw_cdc_certain_dm2,psw_dm_type1, 
+ psw_cdc_possible_asthma, psw_cdc_possible_cereb_vasc, psw_cdc_possible_other_resp,psw_cdc_possible_htn, 
+ sw_imunosuppressed, psw_cdc_possible_neuro, psw_hepatic, num_vacc_doses, sw_waned_immunity, vacc1_ww_raw, contains('serology')),
+      by = exposure_cat, # split table by group
+      label = variables_mappings,
+      statistic = all_continuous() ~ "{mean} ({sd}), {median} ({p25},{p75})",
+      missing = "ifany", # don't list missing data separately
+    ) %>%
+      modify_header(label = "**Variable**") %>% # update the column header
+      modify_header(update = all_stat_cols() ~ "**{ifelse(level==0,'No Regeneron','Regeneron')}**, N = {n} ({style_percent(p, symbol = TRUE)})") %>%
+      bold_labels() %>%
+      add_overall() 
+  table1 %>%
+    gtsummary::as_flex_table() %>% 
+    save_as_docx(path= glue("Results/table1.docx"))
+  
+  table1
+}
+
+```
+
+```{r echo=FALSE}
+filename = glue("feathers/{params$input_table}_cleaned.feather")
+write_feather(df3, filename)
+```
+
+```{r warning=FALSE, include=FALSE}
+if (params$psm == 0) {
+formula = exposure_cat ~ 
+            age + 
+            pc_ses_comb20 + 
+            vacc1_ww +
+            bmi
+} else {
+  formula = exposure_cat ~ age_group + bmi_cat + simplified_vacc1_ww+ SES+ sex+ sector_cat+sw_imunosuppressed + psw_preg
+}
+
+exact_formula = ~ 
+            sex +
+            sector_cat + 
+            sw_imunosuppressed +
+            psw_preg
+
+```
+#####################################################
+#         M A T C H I N G
+#####################################################
+
+```{r matching slow, echo=FALSE, message=TRUE, warning=FALSE}
+matched_df = match_multiple_controls_without_immortal_time_bias(df3, formula, exact_formula, params$num_controls , distance_method = case_when(params$psm == 1 ~ "ps", T  ~"mahalanobis"))
+```
+
+```{r}
+unmatched_df =  
+  df3 %>% 
+  filter(exposure_cat == 0) %>% 
+  left_join(matched_df %>%
+              filter(exposure_cat == 0) %>% 
+              select(exposure_cat,guid_tz)
+            ,by='guid_tz') %>% 
+  mutate(is_matched = case_when(is.na(exposure_cat.y) ~ 'No' , T ~ 'Yes' ))
+```
+```{r eval=FALSE, include=FALSE}
+unmatched_df %>% 
+  group_by(is_matched) %>% 
+  count()
+```
+
+
+### number of matched subjects in each arm
+```{r echo=FALSE}
+matched_df %>% 
+  group_by(arm) %>% 
+  count() %>% 
+  pull(n)
+```
+
+### Overall Matching formula:
+`r deparse(formula)`\
+
+### Exact matching variables :
+`r deparse(exact_formula)`\
+
+### Covariate balance after matching
+Note: The red dots are the balance against the entire pool of control candidates 
+```{r love_plot, echo=F, message=FALSE, warning=FALSE}
+
+love_df = df3 %>%
+  filter(exposure==0) %>% 
+  anti_join(matched_df %>% filter(exposure==0), by='guid_tz') %>% 
+  bind_rows(matched_df )
+
+if (params$psm == 1) {
+  covariates = love_df %>%
+  select(age_group,bmi_cat , simplified_vacc1_ww, SES, sex, sector_cat,sw_imunosuppressed, psw_preg)
+} else {
+  covariates = love_df %>%
+  select(age, bmi ,vacc1_ww , pc_ses_comb20 , sex ,sector_cat,sw_imunosuppressed ,  psw_preg)
+}
+
+
+# data frame interface:
+balanced_table = bal.tab(covariates,
+                 treat = "exposure", data = love_df, un=T,
+                 subclass = "subclass", disp.subclass = F,
+                 s.d.denom = "pooled")
+
+
+variables_mappings = list(sex ~ "Gender",
+                   age ~ "Age",
+                   age_group ~ "Age Group",
+                   SES ~ "Socioeconomic status",
+                   pn_flu_vacc_5yr ~ "Flu vaccination in the last 5 years",
+                   bmi_cat ~ "BMI",
+                   pc_smoke_desc ~ "Smoking status",
+                   psw_cdc_certain_cancer ~ "Cancer (n,%)",
+                   psw_cdc_certain_ckd ~ "Chronic kidney disease (n,%)",
+                   psw_cdc_certain_copd ~ "Chronic obstructive pulmonary disease (n,%)",
+                   psw_cdc_certain_heart ~ "Heart disease (n,%)",
+                   overweight ~ "Overweight: BMI, 25 to 30",
+                   obesity ~ "Obesity: BMI, 30 to 40",
+                   severe_obesity ~ "Severe obesity: BMI 40+",
+                   psw_preg ~ "Pregnancy",
+                   psw_cdc_certain_sickle ~ "Sickle cell disease (n,%)",
+                   psw_cdc_certain_dm2 ~ "Type 2 diabetes mellitus (n,%)",
+                   psw_cdc_possible_asthma ~ "Asthma (n,%)",
+                   psw_cdc_possible_cereb_vasc ~ "Cerebrovascular disease (n,%)",
+                   psw_cdc_possible_other_resp ~ "Other respiratory disease (n,%)",
+                   psw_cdc_possible_htn ~ "Hypertension (n,%)",
+                   sw_imunosuppressed ~ "Immunosuppression (n,%)",
+                   psw_cdc_certain_immuno ~ "Organ Transplant (n,%)",
+                   psw_cdc_possible_neuro ~ "Neurological disease (n,%)",
+                   psw_hepatic ~ "Liver disease (n,%)",
+                   psw_dm_type1 ~ "Type 1 diabetes mellitus (n,%)",
+                   sw_waned_immunity ~ "Waned Immunity", 
+                   simplified_vacc1_ww ~ "first vaccine dose (weeks from campaign launch) ",
+                   sector_cat ~ "Sector",
+                   num_vacc_doses ~ "Num vaccine doses"
+                   )
+
+
+
+variables_mappings_vec = lapply(variables_mappings, rhs)
+names(variables_mappings_vec)  =  lapply(variables_mappings, lhs)
+variables_mappings_vec = append(variables_mappings_vec, c(age = "Age", bmi = "BMI", pc_ses_comb20 = "SES (20 levels)",  vacc1_ww = "first vaccine dose (weeks from campaign launch)",pn_pack_years = "Smoking Pack Years"))
+
+
+```
+```{r}
+p = love.plot(balanced_table,
+          drop.missing=F,
+          disp.subclass=F,
+          stats = c("mean.diffs"),
+          sample.names = c("Unmatched", "Matched"),
+          abs = T,
+          var.names = variables_mappings_vec,
+          line = F, 
+          thresholds = c(m = .1))
+
+    ggsave(glue("Results/covariate_balance.png"), print(p))
+p
+```
+
+# per variable densities after matching
+```{r}
+plot_var(matched_df, pn_pack_years)
+plot_var(matched_df, bmi)
+plot_var(matched_df, age)
+plot_var(matched_df, vacc1_ww_raw)
+plot_var(matched_df, pc_ses_comb20)
+```
+
+```{r include=FALSE}
+show_worst_matches(matched_df, bmi, simplified_bmi )
+show_worst_matches(matched_df, age, age, quantile = 0.80, nrows = 20 )
+show_worst_matches(matched_df, pn_pack_years, simplified_pack_years )
+show_worst_matches(matched_df, pc_ses_comb20, simplified_ses )
+
+```
+```{r include=FALSE}
+table_vars = c('exposure_cat','age', 'age_group', 'sector_cat', 'sex', 'SES', 'pn_flu_vacc_5yr', 'bmi_cat', 'pc_smoke_desc',  'psw_cdc_certain_cancer', 'psw_cdc_certain_ckd', 'psw_cdc_certain_copd', 'psw_cdc_certain_heart', 'severe_obesity', 'obesity', 'overweight', 'psw_preg', 'psw_cdc_certain_sickle', 'psw_cdc_certain_dm2', 'psw_dm_type1', 'psw_cdc_possible_asthma', 'psw_cdc_possible_cereb_vasc', 'psw_cdc_possible_other_resp', 'psw_cdc_possible_htn', 'sw_imunosuppressed', 'psw_cdc_certain_immuno', 'psw_cdc_possible_neuro', 'psw_hepatic', 'num_vacc_doses', 'sw_waned_immunity', 'simplified_vacc1_ww')
+
+```
+
+
+# Table3
+#### matched population stratified by epxosure
+```{r table3, echo=FALSE, message=FALSE, warning=FALSE}
+if (params$create_table3  == 1) {
+  table3 =  tbl_summary(
+      matched_df ,
+      by = exposure_cat, # split table by group
+      label = variables_mappings,
+      statistic = all_continuous() ~ "{mean} ({sd}), {median} ({p25},{p75})",
+      missing = "ifany", # don't list missing data separately,
+      include = all_of(table_vars)
+      
+    ) %>%
+      modify_header(label = "**Variable**") %>% # update the column header
+      modify_header(update = all_stat_cols() ~ "**{ifelse(level==0,'No Regeneron','Regeneron')}**, N = {n} ({style_percent(p, symbol = TRUE)})") %>%
+      bold_labels() %>%
+      add_overall() 
+  table3 %>%
+    gtsummary::as_flex_table() %>% 
+    save_as_docx(path= glue("Results/table3.docx"))
+  
+  table3
+  
+}
+```
+
+
+# Table3.a
+#### UNmatched population
+```{r table3a, echo=FALSE, message=FALSE, warning=FALSE}
+if (params$create_table3  == 1) {
+  table3a =  tbl_summary(
+      unmatched_df ,
+      by = is_matched, 
+      label = variables_mappings,
+      statistic = all_continuous() ~ "{mean} ({sd}), {median} ({p25},{p75})",
+      missing = "ifany", # don't list missing data separately,
+      include = all_of(table_vars[table_vars != 'exposure_cat'])
+      
+    ) %>%
+      modify_header(label = "**Variable**") %>% # update the column header
+      modify_header(update = all_stat_cols() ~ "**{ifelse(level=='No','Unmatched Controls','Matched Controls')}**, N = {n} ({style_percent(p, symbol = TRUE)})") %>%  
+      bold_labels() %>% 
+      add_overall() 
+  table3a %>%
+    gtsummary::as_flex_table() %>% 
+    save_as_docx(path= glue("Results/table3a.docx"))
+  
+  table3a
+  
+}
+```
+
+
+```{r include=FALSE}
+filename = glue("feathers/matched/regeneron_effectivness_matched.feather")
+write_feather(matched_df, filename)
+```
+
