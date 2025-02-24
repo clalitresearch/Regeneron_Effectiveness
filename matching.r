@@ -9,15 +9,15 @@ editor: visual
 pacman::p_load(tidyverse, cri.utils, MatchIt, skimr, optmatch, gtsummary, cobalt, parallel)
 
 activate_keytab("tommuspim")
-system2("kinit" ,args=("-k -t /workspace/Clalit_Active_General_pop_nov22/configurations/InnovationDev1.keytab InnovationDev1"), stdout = TRUE, stderr = TRUE)
+system2("kinit" ,args=("-k -t "), stdout = TRUE, stderr = TRUE)
 con <- cri_connection()
-raw_data_con <- connect_table(con, "Mechkar.[CLALIT\\tommuspim]", "activeToPair_General")
+raw_data_con <- connect_table(con, "db.[schema]", "table_name")
 raw_data <- raw_data_con %>% dplyr::collect() %>%
   mutate(Condition = if_else(Condition == 'Active', 1, 0))
 
 # getwd()
-write_rds(raw_data, '//workspace//Clalit_Active_General_pop_nov22//Clalit_Active_General_pop_nov22//Analysis//R//Data//dataToMatch.rds')
-raw_data <- read_rds('//workspace//Clalit_Active_General_pop_nov22//Clalit_Active_General_pop_nov22//Analysis//R//Data//dataToMatch.rds')
+write_rds(raw_data, 'file')
+raw_data <- read_rds('file')
 
 noNA_data <- raw_data %>% 
   # drop_na() %>% 
