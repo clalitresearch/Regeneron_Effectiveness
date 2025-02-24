@@ -8,7 +8,7 @@ editor: visual
 pacman::p_load(tidyverse, cri.utils, skimr, gtsummary)
 cri.utils::activate_keytab("tommus")
 con <- cri.utils::cri_connection()
-Data <- connect_table(con, "Mechkar.[CLALIT\\tommuspim]", "Clalit_Active_General_pop_nov22_final_extended_for_paper_20231001_ANNONIMIZED") %>%
+Data <- connect_table(con, "dbo.[scheme]", "table_name") %>%
   dplyr::collect() %>%
   mutate(pn_flu_vacc_5yr = as.numeric(as.character(pn_flu_vacc_5yr)),
         historic_DT2_diag = if_else(as.numeric(historic_DT2_diag) == 2, 1, as.numeric(historic_DT2_diag)),
