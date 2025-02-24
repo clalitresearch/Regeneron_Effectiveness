@@ -12,7 +12,7 @@ editor: visual
 pacman::p_load(tidyverse, cri.utils, skimr, gtsummary, ggfortify, ggplot2, gmodels, survival, grDevices, patchwork, smoothHR)
 cri.utils::activate_keytab("tommuspim") # innovationprod
 con <- cri.utils::cri_connection()
-Data <- connect_table(con, "Mechkar.[CLALIT\\tommuspim]", "Clalit_Active_General_pop_nov22_final_extended_for_paper_20231001_ANNONIMIZED") %>%
+Data <- connect_table(con, "db.[scheme]", "table_name") %>%
   collect() %>%
       mutate(imputed_pn_gp_visits_5yr = ifelse(is.na(pn_gp_visits_5yr), round(median(pn_gp_visits_5yr, na.rm = T)), pn_gp_visits_5yr)
              , historic_DT2_diag = if_else(historic_DT2_diag == 2, 1, 0))
