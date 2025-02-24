@@ -8,10 +8,10 @@ editor: visual
 ```{r}
 pacman::p_load(tidyverse, cri.utils, MatchIt, skimr, optmatch, gtsummary, cobalt, parallel)
 
-activate_keytab("tommuspim")
+activate_keytab("username")
 system2("kinit" ,args=("-k -t "), stdout = TRUE, stderr = TRUE)
 con <- cri_connection()
-raw_data_con <- connect_table(con, "db.[schema]", "table_name")
+raw_data_con <- connect_table(con, "db.[scheme]", "table_name")
 raw_data <- raw_data_con %>% dplyr::collect() %>%
   mutate(Condition = if_else(Condition == 'Active', 1, 0))
 
